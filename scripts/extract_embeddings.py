@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from decord import VideoReader
+from tqdm import tqdm
 
 # Add project root to path so we can import src.*
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -158,12 +159,9 @@ def load_video(video_path: str, num_frames: int = NUM_FRAMES) -> np.ndarray:
     vr = VideoReader(video_path)
     total_frames = len(vr)
 
-    if total_frames >= num_frames:
-        # Uniformly sample num_frames indices from the full video
-        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-    else:
-        # Use all available frames
-        indices = np.arange(total_frames)
+    # Uniformly sample num_frames indices from the full video (even if fewer frames)
+    # This will duplicate frames if total_frames < num_frames
+    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
 
     video = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
     return video
@@ -320,29 +318,32 @@ def process_video_directory(
 
     # Process in batches: we batch gt and fail videos together
     # Each "pair" contributes 2 videos, so effective batch = batch_size pairs = 2*batch_size videos
-    for start_idx in range(0, len(pairs), batch_size):
-        batch_pairs = pairs[start_idx : start_idx + batch_size]
+    
+    # Calculate number of batches for tqdm
+    total_batches = (len(pairs) + batch_size - 1) // batch_size
+    
+    with tqdm(total=len(pairs), desc=f"  Processing {len(pairs)} pairs", unit="pair") as pbar:
+        for start_idx in range(0, len(pairs), batch_size):
+            batch_pairs = pairs[start_idx : start_idx + batch_size]
 
-        # Collect all video paths for this batch (interleaved: gt, fail, gt, fail, ...)
-        all_paths = []
-        for _, gt_path, fail_path in batch_pairs:
-            all_paths.append(gt_path)
-            all_paths.append(fail_path)
+            # Collect all video paths for this batch (interleaved: gt, fail, gt, fail, ...)
+            all_paths = []
+            for _, gt_path, fail_path in batch_pairs:
+                all_paths.append(gt_path)
+                all_paths.append(fail_path)
 
-        # Extract embeddings for the whole batch
-        embeddings = extract_embeddings_batch(encoder, all_paths, transform, pool_fn, device)
+            # Extract embeddings for the whole batch
+            embeddings = extract_embeddings_batch(encoder, all_paths, transform, pool_fn, device)
 
-        # Unpack: even indices are success, odd indices are failure
-        for i, (folder_name, _, _) in enumerate(batch_pairs):
-            results[folder_name] = {
-                "success_emb": embeddings[2 * i],
-                "failure_emb": embeddings[2 * i + 1],
-            }
+            # Unpack: even indices are success, odd indices are failure
+            for i, (folder_name, _, _) in enumerate(batch_pairs):
+                results[folder_name] = {
+                    "success_emb": embeddings[2 * i],
+                    "failure_emb": embeddings[2 * i + 1],
+                }
 
-        processed = min(start_idx + batch_size, len(pairs))
-        print(f"  Processed {processed}/{len(pairs)} pairs", end="\r")
+            pbar.update(len(batch_pairs))
 
-    print()  # newline after progress
     return results
 
 
@@ -386,6 +387,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Check device availability
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available. Please run with --device cpu or use a machine with a GPU.")
 
     # Setup output directory
     output_dir = PROJECT_ROOT / args.output_dir
